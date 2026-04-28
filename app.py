@@ -148,4 +148,120 @@ def train_new_model(df_raw, df_loyalty):
 with st.sidebar:
     st.image("https://cdn-icons-png.flaticon.com/512/2601/2601112.png", width=80)
     st.title("Data Input")
-    uploaded_data = st.file_uploader("1. Transaksi (CSV/Parquet)",
+    uploaded_data = st.file_uploader("1. Transaksi (CSV/Parquet)", type=['parquet', 'csv'])
+    uploaded_loyalty = st.file_uploader("2. Data Loyalty (Opsional)", type=['csv'])
+    
+    df_raw, df_l = None, None
+    if uploaded_data:
+        uploaded_data.seek(0)
+        df_raw = pd.read_parquet(uploaded_data) if uploaded_data.name.endswith('.parquet') else pd.read_csv(uploaded_data)
+    if uploaded_loyalty:
+        uploaded_loyalty.seek(0)
+        df_l = pd.read_csv(uploaded_loyalty)
+
+    st.markdown("---")
+    if df_raw is not None:
+        if st.button("⚙️ Retrain & Sinkronkan Model", use_container_width=True):
+            train_new_model(df_raw, df_l)
+            
+    st.caption("Retail Churn Analytics v4.1")
+
+# ════════════════════════════════════════════════════════════
+# 5. DASHBOARD UTAMA
+# ════════════════════════════════════════════════════════════
+
+try:
+    model = joblib.load(os.path.join(MODEL_DIR, "model_best.pkl"))
+    with open(os.path.join(MODEL_DIR, "metadata.json"), "r") as f:
+        meta = json.load(f)
+    features_list = meta['features']
+except:
+    st.warning("⚠️ Model belum tersedia atau tidak valid. Silakan unggah data dan klik **Retrain & Sinkronkan Model** di sidebar.")
+    model = None
+
+if df_raw is not None and model is not None:
+    st.title("🎯 Retail Churn Intelligence")
+    
+    with st.spinner("Memproses data pelanggan..."):
+        df_clean = cleansing_data(df_raw)
+        current_cutoff = df_clean['Tanggal Transaksi'].max()
+        
+        agg = feature_engineering(df_clean, df_l, current_cutoff)
+        X_pred, _ = encode_features(agg, features_list) # Memastikan kolom 100% sama dengan model
+        
+        probs = model.predict_proba(X_pred)[:, 1]
+        agg['Prob_Churn'] = probs
+        agg['Level_Risiko'] = np.where(probs > 0.26, "🚨 TINGGI", "✅ AMAN")
+        
+        total_toko = len(agg)
+        toko_risiko = len(agg[agg['Level_Risiko'] == "🚨 TINGGI"])
+        churn_rate = (toko_risiko / total_toko) * 100 if total_toko > 0 else 0
+        revenue_at_risk = agg[agg['Level_Risiko'] == "🚨 TINGGI"]['Monetary'].sum()
+
+    st.markdown(f"**Data Historis Terakhir:** `{current_cutoff.strftime('%d %B %Y')}`")
+    
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Toko Aktif", f"{total_toko:,}")
+    c2.metric("Toko Berisiko (Prediksi)", f"{toko_risiko:,}", f"{churn_rate:.1f}% Churn Rate", delta_color="inverse")
+    c3.metric("Loyalty Risk", len(agg[(agg['Level_Risiko'] == "🚨 TINGGI") & (agg['Is_Loyalty'] == 1)]))
+    
+    val_str = f"Rp {revenue_at_risk/1e9:.2f} Miliar" if revenue_at_risk > 1e9 else f"Rp {revenue_at_risk/1e6:.2f} Juta"
+    c4.metric("Potensi Rupiah Hilang", val_str, "Revenue at Risk", delta_color="inverse")
+
+    st.markdown("---")
+    tab1, tab2, tab3 = st.tabs(["📊 Executive Summary", "📋 Actionable Watchlist", "🔍 Deep Dive Analytics"])
+
+    with tab1:
+        col_a, col_b = st.columns(2)
+        with col_a:
+            risk_by_region = agg[agg['Level_Risiko'] == "🚨 TINGGI"].groupby('Regional').size().reset_index(name='Jumlah Toko')
+            fig_bar = px.bar(risk_by_region, x='Regional', y='Jumlah Toko', text_auto=True, 
+                             title="Toko Berisiko Tinggi per Regional",
+                             color='Regional', color_discrete_sequence=px.colors.qualitative.Set2)
+            st.plotly_chart(fig_bar, use_container_width=True)
+            
+        with col_b:
+            risk_dist = agg['Level_Risiko'].value_counts().reset_index()
+            risk_dist.columns = ['Status', 'Jumlah']
+            fig_pie = px.pie(risk_dist, values='Jumlah', names='Status', hole=0.4, 
+                             title="Persentase Status Risiko",
+                             color='Status', color_discrete_map={"🚨 TINGGI": "#ef4444", "✅ AMAN": "#22c55e"})
+            st.plotly_chart(fig_pie, use_container_width=True)
+
+    with tab2:
+        st.subheader("Daftar Toko Prioritas Intervensi")
+        f_col1, f_col2, f_col3 = st.columns(3)
+        region_filter = f_col1.multiselect("Pilih Regional", options=agg['Regional'].unique(), default=agg['Regional'].unique())
+        loyalty_filter = f_col2.selectbox("Status Loyalty", options=["Semua", "Hanya Peserta Loyalty", "Non-Loyalty"])
+        
+        display_df = agg[agg['Regional'].isin(region_filter)].copy()
+        if loyalty_filter == "Hanya Peserta Loyalty": display_df = display_df[display_df['Is_Loyalty'] == 1]
+        elif loyalty_filter == "Non-Loyalty": display_df = display_df[display_df['Is_Loyalty'] == 0]
+            
+        display_df = display_df.sort_values('Prob_Churn', ascending=False)
+        tabel_tayang = display_df[['Regional', 'Cluster_Pareto', 'Recency', 'Tonnage_Drop', 'Prob_Churn', 'Level_Risiko']].copy()
+        tabel_tayang['Prob_Churn'] = (tabel_tayang['Prob_Churn'] * 100).round(1).astype(str) + "%"
+        tabel_tayang['Tonnage_Drop'] = tabel_tayang['Tonnage_Drop'].round(2)
+        
+        st.dataframe(tabel_tayang, use_container_width=True, height=400)
+        st.download_button("📥 Ekspor Data ke CSV", display_df.to_csv().encode('utf-8'), "watchlist_eksekusi.csv")
+
+    with tab3:
+        st.subheader("Analisis Perilaku Pelanggan")
+        col_c, col_d = st.columns(2)
+        with col_c:
+            fig_scatter = px.scatter(agg, x="Recency", y="Tonnage_Drop", color="Level_Risiko", 
+                                     size="Monetary", hover_name=agg.index, opacity=0.7,
+                                     title="Peta Risiko: Recency vs Tonnage Drop",
+                                     color_discrete_map={"🚨 TINGGI": "red", "✅ AMAN": "green"})
+            st.plotly_chart(fig_scatter, use_container_width=True)
+        with col_d:
+            fig_hist = px.histogram(agg, x="Prob_Churn", nbins=20, 
+                                    title="Distribusi Probabilitas Churn",
+                                    color_discrete_sequence=['#636efa'])
+            fig_hist.add_vline(x=0.26, line_dash="dash", line_color="red", annotation_text="Batas Risiko (26%)")
+            st.plotly_chart(fig_hist, use_container_width=True)
+
+elif df_raw is None:
+    st.markdown("<h1 style='text-align: center; color: #888; margin-top: 50px;'>Selamat Datang di Retail Churn Analytics</h1>", unsafe_allow_html=True)
+    st.markdown("<p style='text-align: center; color: #888;'>Silakan unggah data transaksi Anda pada panel di sebelah kiri untuk memulai.</p>", unsafe_allow_html=True)
