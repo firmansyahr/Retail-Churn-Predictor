@@ -8,3 +8,5 @@ xgboost
 imbalanced-learn
 openpyxl
 python-dateutil
+pyarrow
+fastparquet
