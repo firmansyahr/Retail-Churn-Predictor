@@ -1,0 +1,10 @@
+streamlit
+pandas
+numpy
+scikit-learn
+joblib
+plotly
+xgboost
+imbalanced-learn
+openpyxl
+python-dateutil
