@@ -10,7 +10,7 @@ import plotly.express as px
 # ════════════════════════════════════════════════════════════
 # 1. KONFIGURASI GLOBAL & STYLE
 # ════════════════════════════════════════════════════════════
-st.set_page_config(page_title="Retail Churn Intelligence v4.2", page_icon="🎯", layout="wide")
+st.set_page_config(page_title="Retail Churn Intelligence v4.3", page_icon="🎯", layout="wide")
 
 MODEL_DIR = "models/"
 REGIONAL_MAP = {'REGIONAL 1': 'SP', 'REGIONAL 2': 'SMBR', 'REGIONAL 6': 'ST'}
@@ -23,23 +23,22 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ════════════════════════════════════════════════════════════
-# 2. CORE FUNCTIONS (SINKRON DENGAN COLAB TERBARU)
+# 2. CORE FUNCTIONS (IDENTIK 1:1 DENGAN COLAB)
 # ════════════════════════════════════════════════════════════
 
 @st.cache_data(show_spinner=False)
 def cleansing_data(df):
     df = df.copy()
-    # Konversi Tanggal
     for col in ['Tanggal Transaksi', 'Created_at_Dist']:
         if col in df.columns: 
             df[col] = pd.to_datetime(df[col], errors='coerce')
-    # Konversi Numerik
-    for col in ['Harga', 'Zak Quantity', 'TON Quantity', 'Harga_Per_KG']:
+            
+    for col in ['Harga', 'Zak Quantity', 'TON Quantity', 'Weight_Est', 'Harga_Per_KG']:
         if col in df.columns: 
             df[col] = pd.to_numeric(df[col], errors='coerce')
-    
-    # Normalisasi Teks
-    text_cols = ['Nama Toko', 'Area AP Toko', 'Brands', 'Cluster Pareto', 'Tipe Customer', 'SSM', 'ASM', 'TSO']
+            
+    text_cols = ['Nama Toko', 'Kabupaten Toko', 'Area AP Toko', 'Brands', 
+                 'Cluster Pareto', 'Tipe Customer', 'SSM', 'ASM', 'TSO']
     for col in text_cols:
         if col in df.columns:
             df[col] = df[col].astype(str).str.strip().str.upper().replace({'NAN':np.nan, 'NONE':np.nan, '':np.nan})
@@ -47,7 +46,6 @@ def cleansing_data(df):
     if 'Area AP Toko' in df.columns: 
         df['Area AP Toko'] = df['Area AP Toko'].map(REGIONAL_MAP).fillna(df['Area AP Toko'])
         
-    # Fillna Cerdas
     if 'Cluster Pareto' in df.columns: df['Cluster Pareto'] = df['Cluster Pareto'].fillna('BRONZE')
     for col in ['SSM', 'ASM', 'TSO', 'Area AP Toko', 'Tipe Customer', 'Brands']:
         if col in df.columns: df[col] = df[col].fillna('UNKNOWN')
@@ -67,35 +65,72 @@ def feature_engineering(df, df_loyalty, cutoff):
     
     df_tr['Days_Ago'] = (cutoff - df_tr['Tanggal Transaksi']).dt.days
 
-    # AGREGASI 143 FITUR (RFM, Salesman, Brand, dll)
+    # FULL AGREGASI (Persis seperti di Notebook)
     agg = df_tr.groupby('ID Toko').agg(
         last_trx         = ('Tanggal Transaksi', 'max'),
         Frequency        = ('No Transaksi', 'count'),
         Total_Ton        = ('TON Quantity', 'sum'),
         Monetary         = ('Est_Spend', 'sum'),
         Avg_Harga_Per_KG = ('Harga_Per_KG', 'mean'),
+        Std_Harga_Per_KG = ('Harga_Per_KG', 'std'),
         Regional         = ('Area AP Toko', 'first'),
         Cluster_Pareto   = ('Cluster Pareto', 'first'),
         Tipe_Customer    = ('Tipe Customer', 'first'),
         Dominant_Brand   = ('Brands', lambda x: x.mode()[0] if len(x) else 'UNKNOWN'),
+        Num_Brands       = ('Brands', 'nunique'),
+        Num_Kab          = ('Kabupaten Toko', 'nunique'),
+        Num_Produk       = ('Kode Produk', 'nunique'),
         Dominant_SSM     = ('SSM', lambda x: x.mode()[0] if len(x) else 'UNKNOWN'),
         Dominant_ASM     = ('ASM', lambda x: x.mode()[0] if len(x) else 'UNKNOWN'),
         Dominant_TSO     = ('TSO', lambda x: x.mode()[0] if len(x) else 'UNKNOWN'),
     )
     
     agg['Recency'] = (cutoff - agg['last_trx']).dt.days
+    agg['Last_Trx_Month'] = agg['last_trx'].dt.month
 
-    # Tonnage Drop logic
+    # Harga Fluktuasi
+    last_price = df_tr.sort_values('Tanggal Transaksi').groupby('ID Toko')['Harga_Per_KG'].last()
+    agg['Price_Delta'] = last_price - agg['Avg_Harga_Per_KG']
+
+    # Tonnage Drop Logic
     recent = df_tr[df_tr['Days_Ago'] <= RECENT_DAYS].groupby('ID Toko')['TON Quantity'].sum()
     past = (df_tr[(df_tr['Days_Ago'] > RECENT_DAYS) & (df_tr['Days_Ago'] <= PAST_DAYS)]
             .groupby('ID Toko')['TON Quantity'].sum() / 3)
     agg['Tonnage_Drop'] = (recent / (past + 0.001)).fillna(0).clip(upper=10)
 
-    # RFM Scoring sederhana untuk visualisasi
-    agg['R_Score'] = pd.qcut(agg['Recency'], q=5, labels=False, duplicates='drop').fillna(0)
-    agg['F_Score'] = pd.qcut(agg['Frequency'], q=5, labels=False, duplicates='drop').fillna(0)
-    agg['M_Score'] = pd.qcut(agg['Monetary'], q=5, labels=False, duplicates='drop').fillna(0)
-    agg['RFM_Score'] = (agg['R_Score'] + agg['F_Score'] + agg['M_Score']) / 3
+    # Menghitung Average Gap Transaksi
+    def avg_gap_fn(x):
+        s = x.sort_values()
+        return s.diff().dt.days.mean() if len(s) >= 2 else np.nan
+    agg['Avg_Gap'] = df_tr.groupby('ID Toko')['Tanggal Transaksi'].apply(avg_gap_fn).fillna(agg['Recency'])
+
+    if 'Created_at_Dist' in df_tr.columns:
+        lag = df_tr.groupby('ID Toko').apply(lambda x: (x['Tanggal Transaksi'] - x['Created_at_Dist']).dt.days.mean())
+        agg['Avg_Input_Lag'] = lag.fillna(0).clip(lower=0, upper=30)
+
+    # Performa Toko vs Rata-rata Regional
+    reg_stats = df_tr.groupby('Area AP Toko').agg(
+        Reg_Avg_Ton   = ('TON Quantity', 'mean'),
+        Reg_Avg_Harga = ('Harga_Per_KG', 'mean')
+    )
+    agg = agg.join(reg_stats, on='Regional')
+    agg['Ton_vs_Regional']   = agg['Total_Ton'] / (agg['Reg_Avg_Ton'] + 0.001)
+    agg['Harga_vs_Regional'] = agg['Avg_Harga_Per_KG'] / (agg['Reg_Avg_Harga'] + 0.001)
+
+    # RFM Scoring
+    if len(agg['Recency'].dropna()) > 0:
+        r_labels = pd.qcut(agg['Recency'], q=5, duplicates='drop', labels=False)
+        agg['R_Score'] = (r_labels.max() - r_labels + 1).astype(float)
+    else: agg['R_Score'] = 1.0
+
+    for col in ['Frequency', 'Monetary']:
+        if len(agg[col].dropna()) > 0:
+            agg[col[0]+'_Score'] = (pd.qcut(agg[col], q=5, duplicates='drop', labels=False) + 1).astype(float)
+        else: agg[col[0]+'_Score'] = 1.0
+
+    agg['RFM_Score'] = agg[['R_Score', 'F_Score', 'M_Score']].mean(axis=1).round(2)
+    c_map = {'BRONZE':1, 'SILVER':2, 'GOLD':3, 'PLATINUM':4, 'SUPER PLATINUM':5}
+    agg['Cluster_Score'] = agg['Cluster_Pareto'].map(c_map).fillna(1).astype(int)
 
     if df_loyalty is not None and not df_loyalty.empty:
         col_id = df_loyalty.columns[0]
@@ -109,15 +144,16 @@ def feature_engineering(df, df_loyalty, cutoff):
 def encode_features(agg, features_list):
     if agg.empty: return pd.DataFrame()
     
-    # One-Hot Encoding semua kolom kategori
     enc_cols = ['Regional', 'Dominant_Brand', 'Tipe_Customer', 'Dominant_SSM', 'Dominant_ASM', 'Dominant_TSO']
     enc_cols = [c for c in enc_cols if c in agg.columns]
     
     enc = pd.get_dummies(agg, columns=enc_cols, prefix=enc_cols, dtype=int)
     enc.columns = [re.sub(r'[\[\]<>{}:",\s]', '_', str(c)) for c in enc.columns]
     
-    # SINKRONISASI PAKSA: Memastikan kolom 100% cocok dengan metadata model Colab
+    # [KUNCI PERBAIKAN]: Menambah kolom yang tidak ada, lalu MEMBESIHKAN NaN menjadi 0 
     enc = enc.reindex(columns=features_list, fill_value=0)
+    enc = enc.fillna(0) # Menghindari Error "NaN" pada model
+    
     return enc[features_list]
 
 # ════════════════════════════════════════════════════════════
@@ -136,8 +172,10 @@ try:
     with open(os.path.join(MODEL_DIR, "metadata.json"), "r") as f:
         meta = json.load(f)
     features_list = meta['features']
-except:
-    st.error("🚨 Gagal memuat model. Pastikan file .pkl dan .json ada di folder 'models/'.")
+    # Dinamis threshold dari metadata Colab jika ada, jika tidak default 0.26
+    threshold = float(meta.get('thresholds', {}).get('best_model', 0.26))
+except Exception as e:
+    st.error(f"🚨 Gagal memuat model. Error: {e}")
     st.stop()
 
 # ════════════════════════════════════════════════════════════
@@ -145,34 +183,32 @@ except:
 # ════════════════════════════════════════════════════════════
 
 if uploaded_data:
-    # Membaca data
     uploaded_data.seek(0)
     df_raw = pd.read_parquet(uploaded_data) if uploaded_data.name.endswith('.parquet') else pd.read_csv(uploaded_data)
     df_l = pd.read_csv(uploaded_loyalty) if uploaded_loyalty else None
 
     st.title("🎯 Retail Churn Intelligence")
     
-    with st.spinner("Menganalisis 143 parameter perilaku pelanggan..."):
+    with st.spinner("Menganalisis ratusan parameter perilaku toko..."):
         df_clean = cleansing_data(df_raw)
         current_cutoff = df_clean['Tanggal Transaksi'].max()
         
-        # Ekstraksi Fitur & Prediksi
         agg = feature_engineering(df_clean, df_l, current_cutoff)
         X_pred = encode_features(agg, features_list)
         
         probs = model.predict_proba(X_pred)[:, 1]
         agg['Prob_Churn'] = probs
-        agg['Level_Risiko'] = np.where(probs > 0.26, "🚨 TINGGI", "✅ AMAN")
         
-        # Metrik
+        # Penentuan Level Risiko
+        agg['Level_Risiko'] = np.where(probs > threshold, "🚨 TINGGI", "✅ AMAN")
+        
         t_risk = len(agg[agg['Level_Risiko'] == "🚨 TINGGI"])
         rev_risk = agg[agg['Level_Risiko'] == "🚨 TINGGI"]['Monetary'].sum()
 
-    # Layout Dashboard
     st.write(f"📅 **Data Terbaru:** {current_cutoff.strftime('%d %B %Y')}")
     
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Total Toko", f"{len(agg):,}")
+    m1.metric("Total Toko Aktif", f"{len(agg):,}")
     m2.metric("Risiko Churn", f"{t_risk:,}", f"{(t_risk/len(agg)*100):.1f}%")
     m3.metric("Loyalty Risk", len(agg[(agg['Level_Risiko'] == "🚨 TINGGI") & (agg['Is_Loyalty'] == 1)]))
     m4.metric("Revenue at Risk", f"Rp {rev_risk/1e6:.1f} Juta")
@@ -183,7 +219,6 @@ if uploaded_data:
     
     with tab1:
         st.subheader("Daftar Toko Berisiko (Segera Intervensi)")
-        # Filter Regional
         regs = st.multiselect("Filter Regional", options=agg['Regional'].unique(), default=agg['Regional'].unique())
         df_view = agg[agg['Regional'].isin(regs)].sort_values('Prob_Churn', ascending=False)
         
