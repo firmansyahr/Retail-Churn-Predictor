@@ -6,12 +6,11 @@ import json
 import os
 import re
 import plotly.express as px
-import plotly.graph_objects as go
 
 # ════════════════════════════════════════════════════════════
 # 1. KONFIGURASI GLOBAL & STYLE
 # ════════════════════════════════════════════════════════════
-st.set_page_config(page_title="Retail Churn Intelligence v5.0", page_icon="🎯", layout="wide")
+st.set_page_config(page_title="Retail Churn Intelligence v5.1", page_icon="🎯", layout="wide")
 
 MODEL_DIR = "models/"
 REGIONAL_MAP = {'REGIONAL 1': 'SP', 'REGIONAL 2': 'SMBR', 'REGIONAL 6': 'ST'}
@@ -25,15 +24,16 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ════════════════════════════════════════════════════════════
-# 2. CORE FUNCTIONS (IDENTIK 100% DENGAN COLAB)
+# 2. MASTER DATA PIPELINE (DIOPTIMALISASI UNTUK HEMAT RAM)
 # ════════════════════════════════════════════════════════════
 
 @st.cache_data(show_spinner=False)
-def cleansing_data(df):
-    df = df.copy()
+def master_data_pipeline(df, df_loyalty):
+    """Satu fungsi raksasa ini memproses semuanya lalu membuang data mentah dari RAM"""
+    
+    # --- A. CLEANSING ---
     for col in ['Tanggal Transaksi', 'Created_at_Dist']:
         if col in df.columns: df[col] = pd.to_datetime(df[col], errors='coerce')
-            
     for col in ['Harga', 'Zak Quantity', 'TON Quantity', 'Weight_Est', 'Harga_Per_KG']:
         if col in df.columns: df[col] = pd.to_numeric(df[col], errors='coerce')
             
@@ -48,12 +48,14 @@ def cleansing_data(df):
             df[col] = df[col].astype(str).str.strip().str.upper().replace({'NAN':np.nan, 'NONE':np.nan, '':np.nan})
             
     if 'Area AP Toko' in df.columns: df['Area AP Toko'] = df['Area AP Toko'].map(REGIONAL_MAP).fillna(df['Area AP Toko'])
-    df['Lookup_Key'] = df['Nama Toko'].fillna('') + '_' + df.get('Kabupaten Toko', pd.Series(dtype=str)).fillna('')
-    return df
+    
+    # Pengaman Bug Teks (Bulletproof Lookup Key)
+    if 'Kabupaten Toko' in df.columns:
+        df['Lookup_Key'] = df['Nama Toko'].astype(str).fillna('') + '_' + df['Kabupaten Toko'].astype(str).fillna('')
+    else:
+        df['Lookup_Key'] = df['Nama Toko'].astype(str).fillna('')
 
-@st.cache_data(show_spinner=False)
-def smart_backfill(df):
-    df = df.copy()
+    # --- B. SMART BACKFILL ---
     def _fill(d, col, key='Lookup_Key'):
         if col not in d.columns: return d
         m = d.dropna(subset=[col]).drop_duplicates(key).set_index(key)[col]
@@ -82,38 +84,38 @@ def smart_backfill(df):
             
     if 'TON Quantity' in df.columns and 'Harga_Per_KG' in df.columns:
         df['Est_Spend'] = df['TON Quantity'] * 1000 * df['Harga_Per_KG'].fillna(0)
-        
-    return df
 
-@st.cache_data(show_spinner=False)
-def feature_engineering(df, df_loyalty, cutoff):
-    RECENT_DAYS = 30
-    PAST_DAYS = 120
+    # --- C. FEATURE ENGINEERING ---
+    cutoff = df['Tanggal Transaksi'].max()
+    RECENT_DAYS, PAST_DAYS = 30, 120
 
     df_tr = df[df['Tanggal Transaksi'] <= cutoff].copy()
-    if df_tr.empty: return pd.DataFrame()
+    if df_tr.empty: return pd.DataFrame(), cutoff
+    
     df_tr['Days_Ago'] = (cutoff - df_tr['Tanggal Transaksi']).dt.days
 
-    agg = df_tr.groupby('ID Toko').agg(
-        last_trx         = ('Tanggal Transaksi', 'max'),
-        Frequency        = ('No Transaksi', 'count'),
-        Total_Ton        = ('TON Quantity', 'sum'),
-        Monetary         = ('Est_Spend', 'sum'),
-        Avg_Harga_Per_KG = ('Harga_Per_KG', 'mean'),
-        Std_Harga_Per_KG = ('Harga_Per_KG', 'std'),
-        Regional         = ('Area AP Toko', 'first'),
-        Cluster_Pareto   = ('Cluster Pareto', 'first'),
-        Tipe_Customer    = ('Tipe Customer', 'first'),
-        Dominant_Brand   = ('Brands', lambda x: x.mode()[0] if len(x) else 'UNKNOWN'),
-        Num_Brands       = ('Brands', 'nunique'),
-        Num_Kab          = ('Kabupaten Toko', 'nunique') if 'Kabupaten Toko' in df_tr.columns else ('ID Toko', lambda x: 1),
-        Num_Produk       = ('Kode Produk', 'nunique') if 'Kode Produk' in df_tr.columns else ('ID Toko', lambda x: 1),
-        Dominant_SSM     = ('SSM', lambda x: x.mode()[0] if len(x) else 'UNKNOWN'),
-        Dominant_ASM     = ('ASM', lambda x: x.mode()[0] if len(x) else 'UNKNOWN'),
-        Dominant_TSO     = ('TSO', lambda x: x.mode()[0] if len(x) else 'UNKNOWN'),
-    )
+    agg_kwargs = {
+        'last_trx': ('Tanggal Transaksi', 'max'),
+        'Frequency': ('No Transaksi', 'count'),
+        'Total_Ton': ('TON Quantity', 'sum'),
+        'Monetary': ('Est_Spend', 'sum'),
+        'Avg_Harga_Per_KG': ('Harga_Per_KG', 'mean'),
+        'Std_Harga_Per_KG': ('Harga_Per_KG', 'std'),
+        'Regional': ('Area AP Toko', 'first'),
+        'Cluster_Pareto': ('Cluster Pareto', 'first'),
+        'Tipe_Customer': ('Tipe Customer', 'first'),
+        'Dominant_Brand': ('Brands', lambda x: x.mode()[0] if len(x) else 'UNKNOWN'),
+        'Num_Brands': ('Brands', 'nunique'),
+        'Num_Kab': ('Kabupaten Toko', 'nunique') if 'Kabupaten Toko' in df_tr.columns else ('ID Toko', 'count'),
+        'Num_Produk': ('Kode Produk', 'nunique') if 'Kode Produk' in df_tr.columns else ('ID Toko', 'count'),
+        'Dominant_SSM': ('SSM', lambda x: x.mode()[0] if len(x) else 'UNKNOWN'),
+        'Dominant_ASM': ('ASM', lambda x: x.mode()[0] if len(x) else 'UNKNOWN'),
+        'Dominant_TSO': ('TSO', lambda x: x.mode()[0] if len(x) else 'UNKNOWN'),
+    }
+    agg = df_tr.groupby('ID Toko').agg(**agg_kwargs)
     
     agg['Recency'] = (cutoff - agg['last_trx']).dt.days
+    agg['Last_Trx_Month'] = agg['last_trx'].dt.month
 
     last_price = df_tr.sort_values('Tanggal Transaksi').groupby('ID Toko')['Harga_Per_KG'].last()
     agg['Price_Delta'] = last_price - agg['Avg_Harga_Per_KG']
@@ -136,7 +138,6 @@ def feature_engineering(df, df_loyalty, cutoff):
     agg['Ton_vs_Regional']   = agg['Total_Ton'] / (agg['Reg_Avg_Ton'] + 0.001)
     agg['Harga_vs_Regional'] = agg['Avg_Harga_Per_KG'] / (agg['Reg_Avg_Harga'] + 0.001)
 
-    # Menghitung R, F, M Scores (Skala 1-5)
     if len(agg['Recency'].dropna()) > 0:
         r_labels = pd.qcut(agg['Recency'], q=5, duplicates='drop', labels=False)
         agg['R_Score'] = (r_labels.max() - r_labels + 1).astype(float)
@@ -149,7 +150,6 @@ def feature_engineering(df, df_loyalty, cutoff):
 
     agg['RFM_Score'] = agg[['R_Score', 'F_Score', 'M_Score']].mean(axis=1).round(2)
 
-    # Segmentasi RFM Pelanggan (Sesuai Colab)
     def rfm_seg(row):
         r,f,m = row['R_Score'], row['F_Score'], row['M_Score']
         if r>=4 and f>=4 and m>=4:   return 'Champions'
@@ -171,7 +171,7 @@ def feature_engineering(df, df_loyalty, cutoff):
     else:
         agg['Is_Loyalty'] = 0
 
-    return agg
+    return agg, cutoff
 
 def encode_features(agg, features_list):
     if agg.empty: return pd.DataFrame()
@@ -212,19 +212,23 @@ except Exception as e:
 if uploaded_data:
     uploaded_data.seek(0)
     df_raw = pd.read_parquet(uploaded_data) if uploaded_data.name.endswith('.parquet') else pd.read_csv(uploaded_data)
-    df_l = pd.read_csv(uploaded_loyalty) if uploaded_loyalty else None
+    
+    df_l = None
+    if uploaded_loyalty:
+        uploaded_loyalty.seek(0)
+        df_l = pd.read_csv(uploaded_loyalty)
 
     st.title("🎯 Retail Churn Intelligence")
     st.caption(f"🤖 Powered by AI Random Forest (Threshold: {threshold*100:.1f}%)")
     
     with st.spinner("Mengolah ratusan parameter dan segmentasi perilaku toko..."):
-        df_clean = cleansing_data(df_raw)
-        df_clean = smart_backfill(df_clean)
-        current_cutoff = df_clean['Tanggal Transaksi'].max()
+        # Hanya "agg" yang keluar dari pipeline, memory mentah aman!
+        agg, current_cutoff = master_data_pipeline(df_raw, df_l)
         
-        agg = feature_engineering(df_clean, df_l, current_cutoff)
+        # Hapus df_raw dari memory saat ini juga
+        del df_raw
+        
         X_pred = encode_features(agg, features_list)
-        
         probs = model.predict_proba(X_pred)[:, 1]
         agg['Prob_Churn'] = probs
         agg['Level_Risiko'] = np.where(probs > threshold, "🚨 TINGGI", "✅ AMAN")
@@ -248,13 +252,13 @@ if uploaded_data:
     
     with tab1:
         st.subheader("📋 Toko Prioritas Penyelamatan (Top Revenue at Risk)")
-        # Filter Toko yang berisiko tinggi dengan pendapatan terbesar
         top_rescue = agg[agg['Level_Risiko'] == "🚨 TINGGI"].sort_values('Monetary', ascending=False).head(5)
         if not top_rescue.empty:
             cols = st.columns(5)
             for i, (idx, row) in enumerate(top_rescue.iterrows()):
-                with cols[i]:
-                    st.info(f"**Toko ID:** {idx}\n\n**Segmen:** {row['RFM_Segment']}\n\n**Potensi:** Rp {row['Monetary']/1e6:.1f} Jt\n\n**Prob:** {row['Prob_Churn']*100:.1f}%")
+                if i < 5:
+                    with cols[i]:
+                        st.info(f"**Toko ID:** {idx}\n\n**Segmen:** {row['RFM_Segment']}\n\n**Potensi:** Rp {row['Monetary']/1e6:.1f} Jt\n\n**Prob:** {row['Prob_Churn']*100:.1f}%")
 
         st.markdown("<br>", unsafe_allow_html=True)
         st.subheader("🗂️ Tabel Eksekusi Watchlist")
@@ -262,8 +266,6 @@ if uploaded_data:
         df_view = agg[agg['Regional'].isin(regs)].sort_values('Prob_Churn', ascending=False)
         
         display_cols = ['Regional', 'Cluster_Pareto', 'RFM_Segment', 'Recency', 'Tonnage_Drop', 'Monetary', 'Prob_Churn', 'Level_Risiko']
-        
-        # Formatting for display
         df_display = df_view[display_cols].copy()
         df_display['Prob_Churn'] = (df_display['Prob_Churn'] * 100).round(1).astype(str) + "%"
         df_display['Monetary'] = "Rp " + (df_display['Monetary'] / 1e6).round(1).astype(str) + " Jt"
@@ -304,8 +306,10 @@ if uploaded_data:
         with col_d:
             st.subheader("Tingkat Churn per Cluster Pareto")
             churn_par = agg.groupby('Cluster_Pareto').apply(lambda x: (x['Level_Risiko']=='🚨 TINGGI').mean() * 100).reset_index(name='Churn Rate (%)')
-            # Urutkan dari atas ke bawah
             order_cluster = ['SUPER PLATINUM', 'PLATINUM', 'GOLD', 'SILVER', 'BRONZE']
+            
+            # Pengaman untuk membuang segmen UNKNOWN agar plotly tidak error
+            churn_par = churn_par[churn_par['Cluster_Pareto'].isin(order_cluster)]
             churn_par['Cluster_Pareto'] = pd.Categorical(churn_par['Cluster_Pareto'], categories=order_cluster, ordered=True)
             churn_par = churn_par.sort_values('Cluster_Pareto')
             
