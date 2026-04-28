@@ -313,8 +313,15 @@ if uploaded_data:
             churn_par['Cluster_Pareto'] = pd.Categorical(churn_par['Cluster_Pareto'], categories=order_cluster, ordered=True)
             churn_par = churn_par.sort_values('Cluster_Pareto')
             
-            fig_par = px.bar(churn_par, x='Cluster_Pareto', y='Churn Rate (%)', text_auto='.1f',
-                             color='Cluster_Pareto', color_discrete_sequence=px.colors.sequential.Agal_r)
+            # Gunakan 'Viridis' atau 'Blues_r' yang pasti tersedia di semua versi Plotly
+            fig_par = px.bar(
+                churn_par, 
+                x='Cluster_Pareto', 
+                y='Churn Rate (%)', 
+                text_auto='.1f',
+                color='Cluster_Pareto', 
+                color_discrete_sequence=px.colors.sequential.Viridis_r  # Mengganti Agal_r
+            )
             st.plotly_chart(fig_par, use_container_width=True)
 
 else:
